@@ -5,15 +5,23 @@ pulls per-sample FORMAT fields for every locus, and writes a single
 self-contained HTML file with a histogram switchable via two dropdowns:
 
   Locus   which tandem repeat (TRID) to show
-  Metric  AL  Length of each allele
-          MC  Motif count per allele, one histogram per motif
-          MS  Motif span (bp) per allele, one histogram per motif
-          AP  Allele purity per allele
+  Metric  AL   Length of each allele
+          MC   Motif count per allele, one histogram per motif
+          LPS  Longest Pure Segment: longest run of consecutive, perfect
+               copies of the motif in the allele, one histogram per motif
+          MS   Motif span (bp) per allele, one histogram per motif
+          AP   Allele purity per allele
 
-MC and MS are broken out per motif (colored, with a legend) rather than
+MC, LPS and MS are broken out per motif (colored, with a legend) rather than
 summed across a locus's motifs: for loci with more than one motif (e.g.
 CANVAS_RFC1's pathogenic AAGGG vs benign ACAGG), summing would hide exactly
 the distinction that matters.
+
+LPS isn't a TRGT FORMAT field -- it's computed here directly from the allele
+sequence (REF/ALT + each sample's GT), trying every rotation of the motif
+since the actual repeat can be phase-shifted relative to how it's written
+(see is_rotation). Every (locus, distinct allele, motif) LPS value is written
+to LPS_VERIFICATION_PATH alongside the allele sequence itself, to check by eye.
 
 All post-load rendering (which traces are visible, their data, the x-axis
 range/title, the plot title) is driven by a single JS `redraw()` function
@@ -30,6 +38,7 @@ copy numbers, so the AL bands are an approximation (scaled by motif length).
 Swap `vcf_path` below for your own TRGT VCF (plain-text or .vcf.gz).
 """
 
+import doctest
 import gzip
 import json
 import re
@@ -39,9 +48,11 @@ import plotly.graph_objects as go
 
 vcf_path = "data/100HPRC.trgt-v0.8.0.STRchive.sorted.vcf"
 
-METRICS = ["MC", "AL", "MS", "AP"]  # MC first: it's the default/initial view
-INTEGER_METRICS = {"AL", "MC", "MS"}  # AP is the only continuous (0-1) metric
-PER_MOTIF_METRICS = {"MC", "MS"}
+METRICS = ["MC", "LPS", "AL", "MS", "AP"]  # MC first: it's the default/initial view
+INTEGER_METRICS = {"AL", "MC", "MS", "LPS"}  # AP is the only continuous (0-1) metric
+PER_MOTIF_METRICS = {"MC", "MS", "LPS"}
+
+LPS_VERIFICATION_PATH = "lps_verification.tsv"
 
 STRCHIVE_LATEST_RELEASE_URL = "https://api.github.com/repos/dashnowlab/STRchive/releases/latest"
 TIER_COLORS = {"benign": "#54A24B", "intermediate": "#EECA3B", "pathogenic": "#E45756"}
@@ -60,6 +71,10 @@ MOTIF_CLASS_SHADES = {
 METRIC_EXPLANATIONS = {
     "AL": "Total allele length, in base pairs (TRGT genotyper).",
     "MC": "Number of copies of each motif in the allele (TRGT genotyper).",
+    "LPS": "Longest Pure Segment: the longest run of consecutive, perfectly matching "
+           "copies of the motif in a row in the allele sequence, i.e. the biggest "
+           "uninterrupted stretch before a break/interruption. Computed directly from "
+           "the allele sequence (REF/ALT + genotype), not a TRGT FORMAT field.",
     "MS": "Number of base pairs in the allele spanned by each motif (TRGT genotyper).",
     "AP": "Purity: the fraction of the allele matching the "
           "expected motif sequence, ranging from 0 (no match) to 1 (perfect match) (TRGT genotyper).",
@@ -68,6 +83,16 @@ METRIC_EXPLANATIONS = {
 
 def open_vcf(path):
     return gzip.open(path, "rt") if path.endswith(".gz") else open(path)
+
+
+def count_samples(path):
+    """Number of individuals genotyped in the VCF (sample columns after the
+    9 fixed columns in the #CHROM header line)."""
+    with open_vcf(path) as vcf:
+        for line in vcf:
+            if line.startswith("#CHROM"):
+                return len(line.rstrip("\n").split("\t")) - 9
+    return 0
 
 
 def parse_trid(info_field):
@@ -83,11 +108,10 @@ def parse_motifs(info_field):
     return match.group(1).split(",") if match else []
 
 
-def locus_title(locus, motifs, motif_classes):
-    if not motifs:
-        return locus
-    annotated = [f"{m} [{c}]" for m, c in zip(motifs, motif_classes)]
-    return f"{locus} ({', '.join(annotated)})"
+def locus_title(locus, motifs):
+    # Pathogenic/benign/unknown per motif is shown via the legend (color +
+    # label) when MC/MS/LPS are visible, so it's not repeated here.
+    return f"{locus} ({', '.join(motifs)})" if motifs else locus
 
 
 def parse_format_labels(path):
@@ -122,21 +146,97 @@ def parse_ms(token, n_motifs):
     return spans
 
 
+def allele_sequences(ref, alt_field):
+    """VCF allele index -> sequence: 0 is REF, N (N>=1) is the Nth ALT."""
+    return [ref] + (alt_field.split(",") if alt_field != "." else [])
+
+
+def parse_gt(gt_field):
+    """Allele indices carried by this sample (phased '|' or unphased '/'),
+    skipping any missing ('.') haplotype."""
+    return [int(a) for a in re.split(r"[/|]", gt_field) if a != "."]
+
+
+def longest_pure_run(sequence, motif):
+    """Longest run of consecutive, perfect (uninterrupted) copies of `motif`
+    in `sequence` -- the LPS metric, in copies.
+
+    Tries every rotation of `motif`: the actual repeat in the sequence may be
+    phase-shifted relative to how the VCF happens to write the motif (e.g.
+    GAAAT and TGAAA are the same repeated unit -- see is_rotation), and a
+    perfect run only shows up as an exact substring match against the
+    rotation that happens to align with where the repeat starts.
+
+    >>> longest_pure_run("GCCGCCGCCGCCGCCGCCGCCGC", "GCC")  # 7 clean copies, 2bp left over
+    7
+    >>> longest_pure_run("GCCGCCGCCGCCGCCGCTGCCGC", "GCC")  # GCT interruption splits 5 + 1
+    5
+    >>> longest_pure_run("AAAAAA", "GCC")  # motif never appears at all
+    0
+    >>> longest_pure_run("TGAAATGAAATGAAA", "GAAAT")  # written as the rotation TGAAA
+    3
+    >>> longest_pure_run("GCC", "GCCGCC")  # motif longer than the sequence
+    0
+    >>> longest_pure_run("GCCGCC", "")  # no motif to match
+    0
+    """
+    length = len(motif)
+    n = len(sequence)
+    if length == 0 or n < length:
+        return 0
+    best = 0
+    for start in range(length):
+        rotated = motif[start:] + motif[:start]
+        match = [sequence[i:i + length] == rotated for i in range(n - length + 1)]
+        for phase in range(length):
+            run = 0
+            i = phase
+            while i < len(match):
+                if match[i]:
+                    run += 1
+                    best = max(best, run)
+                else:
+                    run = 0
+                i += length
+    return best
+
+
 def parse_loci(path):
-    """Return {locus_name: {"chrom": ..., "end": ..., "motifs": [...],
-    "AL": [...], "AP": [...], "MC": [[per-motif values], ...],
-    "MS": [[per-motif values], ...]}}."""
+    """Return (loci, lps_verification_rows).
+
+    loci: {locus_name: {"chrom": ..., "end": ..., "motifs": [...],
+    "AL": [...], "AP": [...], "MC"/"MS"/"LPS": [[per-motif values], ...]}}.
+
+    lps_verification_rows: one row per (locus, distinct allele, motif) --
+    LPS is computed once per distinct REF/ALT allele (not once per sample),
+    since many samples share the same allele; per-sample GT lookups below
+    just reuse that result."""
     loci = {}
+    verification_rows = []
     with open_vcf(path) as vcf:
         for line in vcf:
             if line.startswith("#"):
                 continue
             fields = line.rstrip("\n").split("\t")
-            chrom, info, fmt, samples = fields[0], fields[7], fields[8], fields[9:]
+            chrom, ref, alt = fields[0], fields[3], fields[4]
+            info, fmt, samples = fields[7], fields[8], fields[9:]
             locus = parse_trid(info)
             end = int(re.search(r"(?:^|;)END=(\d+)", info).group(1))
             motifs = parse_motifs(info)
             n_motifs = len(motifs)
+
+            sequences = allele_sequences(ref, alt)
+            lps_by_allele = [
+                [longest_pure_run(seq, motif) for motif in motifs]
+                for seq in sequences
+            ]
+            for allele_index, seq in enumerate(sequences):
+                for m, motif in enumerate(motifs):
+                    verification_rows.append((
+                        locus, allele_index, len(seq), motif,
+                        lps_by_allele[allele_index][m], seq,
+                    ))
+
             fmt_keys = fmt.split(":")
             al_idx, ap_idx = fmt_keys.index("AL"), fmt_keys.index("AP")
             mc_idx, ms_idx = fmt_keys.index("MC"), fmt_keys.index("MS")
@@ -144,9 +244,11 @@ def parse_loci(path):
             al, ap = [], []
             mc = [[] for _ in range(n_motifs)]
             ms = [[] for _ in range(n_motifs)]
+            lps = [[] for _ in range(n_motifs)]
 
             for sample in samples:
                 sample_fields = sample.split(":")
+                gt_raw = sample_fields[0]
                 al_raw, ap_raw = sample_fields[al_idx], sample_fields[ap_idx]
                 mc_raw, ms_raw = sample_fields[mc_idx], sample_fields[ms_idx]
 
@@ -162,12 +264,24 @@ def parse_loci(path):
                         continue
                     for m, span in enumerate(parse_ms(token, n_motifs)):
                         ms[m].append(span)
+                for allele_index in parse_gt(gt_raw):
+                    if allele_index >= len(sequences):
+                        continue
+                    for m in range(n_motifs):
+                        lps[m].append(lps_by_allele[allele_index][m])
 
             loci[locus] = {
                 "chrom": chrom, "end": end, "motifs": motifs,
-                "AL": al, "AP": ap, "MC": mc, "MS": ms,
+                "AL": al, "AP": ap, "MC": mc, "MS": ms, "LPS": lps,
             }
-    return loci
+    return loci, verification_rows
+
+
+def write_lps_verification(rows, path):
+    with open(path, "w") as f:
+        f.write("locus\tallele_index\tallele_length_bp\tmotif\tlps_copies\tsequence\n")
+        for locus, allele_index, length, motif, lps_value, seq in rows:
+            f.write(f"{locus}\t{allele_index}\t{length}\t{motif}\t{lps_value}\t{seq}\n")
 
 
 def gene_name(locus):
@@ -191,7 +305,15 @@ def fetch_latest_strchive():
 
 def is_rotation(motif_a, motif_b):
     """STR motifs have no fixed reading frame: GAAAT and TGAAA are the same
-    repeated unit read starting at a different position."""
+    repeated unit read starting at a different position.
+
+    >>> is_rotation("GAAAT", "TGAAA")
+    True
+    >>> is_rotation("AAAAT", "TGAAA")  # not a rotation of each other
+    False
+    >>> is_rotation("GCC", "GC")  # different lengths can't be rotations
+    False
+    """
     return len(motif_a) == len(motif_b) and motif_a in (motif_b + motif_b)
 
 
@@ -310,12 +432,12 @@ def build_figure(loci, strchive_version):
                 showarrow=False, font=dict(size=18),
             ),
             dict(
-                text="", x=0.5, xanchor="center", y=-0.20, yanchor="top", xref="paper", yref="paper",
+                text="", x=0.5, xanchor="center", y=-0.34, yanchor="top", xref="paper", yref="paper",
                 showarrow=False, font=dict(size=12), align="left",
             ),
             dict(
                 text=f"STRchive {strchive_version}",
-                x=1.0, xanchor="right", y=-0.46, xref="paper", yref="paper",
+                x=1.0, xanchor="right", y=-0.66, xref="paper", yref="paper",
                 showarrow=False, font=dict(size=11, color="#888"),
             ),
         ],
@@ -326,13 +448,13 @@ def build_figure(loci, strchive_version):
         showlegend=False,
         template="plotly_white",
         width=900,
-        height=520,
-        margin=dict(t=150, b=190),
+        height=700,
+        margin=dict(t=175, b=250),
     )
     return fig, locus_names, max_motifs
 
 
-def redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info):
+def redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info, n_individuals):
     data = {
         locus: {
             "motifs": loci[locus]["motifs"],
@@ -340,19 +462,18 @@ def redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info):
             "AP": loci[locus]["AP"],
             "MC": loci[locus]["MC"],
             "MS": loci[locus]["MS"],
+            "LPS": loci[locus]["LPS"],
         }
         for locus in locus_names
     }
-    locus_titles = {
-        locus: locus_title(locus, loci[locus]["motifs"], strchive_info[locus]["motif_classes"])
-        for locus in locus_names
-    }
+    locus_titles = {locus: locus_title(locus, loci[locus]["motifs"]) for locus in locus_names}
 
     return """
     var gd = document.getElementById('{plot_id}');
     var DATA = %s;
     var LOCUS_NAMES = %s;
     var LOCUS_TITLES = %s;
+    var N_INDIVIDUALS = %s;
     var METRICS = %s;
     var METRIC_LABELS = %s;
     var METRIC_EXPLANATIONS = %s;
@@ -367,7 +488,7 @@ def redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info):
     // STRchive's benign/intermediate/pathogenic ranges are repeat-unit
     // copy numbers. MC is already in those units; AL and MS are bp, so
     // their bands are approximated by scaling with the locus's motif length.
-    var SHAPE_METRIC_SCALE = {AL: 'motif_len', MS: 'motif_len', MC: 1};
+    var SHAPE_METRIC_SCALE = {AL: 'motif_len', MS: 'motif_len', MC: 1, LPS: 1};
 
     var state = {locus: LOCUS_NAMES[0], metric: METRICS[0]};
     // Captured once, before any redraw touches the annotations array: index
@@ -498,8 +619,10 @@ def redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info):
             'marker.color': colorUpd, 'xbins.size': binSize,
         }, idx);
 
+        var nAlleles = xUpd.length ? xUpd[0].length : 0;
         var titleAnnotation = JSON.parse(JSON.stringify(BASE_ANNOTATIONS[0]));
-        titleAnnotation.text = LOCUS_TITLES[locus];
+        titleAnnotation.text = LOCUS_TITLES[locus] +
+            '<br><span style="font-size:12px">' + N_INDIVIDUALS + ' individuals, ' + nAlleles + ' alleles</span>';
         var rangesAnnotation = JSON.parse(JSON.stringify(BASE_ANNOTATIONS[1]));
         rangesAnnotation.text = rangesText(locus);
 
@@ -541,8 +664,12 @@ def redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info):
         'Metric', METRICS, METRICS.map(function(m) { return m + ' (' + METRIC_LABELS[m] + ')'; }),
         state.metric, function(v) { state.metric = v; redraw(); },
     ));
+    function geneName(locus) {
+        var i = locus.indexOf('_');
+        return i === -1 ? locus : locus.substring(i + 1);
+    }
     toolbar.appendChild(addSelect(
-        'Locus', LOCUS_NAMES, LOCUS_NAMES,
+        'Locus', LOCUS_NAMES, LOCUS_NAMES.map(geneName),
         state.locus, function(v) { state.locus = v; redraw(); },
     ));
     gd.parentNode.insertBefore(toolbar, gd);
@@ -553,14 +680,23 @@ def redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info):
 
     redraw();
     """ % (
-        json.dumps(data), json.dumps(locus_names), json.dumps(locus_titles),
+        json.dumps(data), json.dumps(locus_names), json.dumps(locus_titles), json.dumps(n_individuals),
         json.dumps(METRICS), json.dumps(metric_labels), json.dumps(METRIC_EXPLANATIONS), json.dumps(list(INTEGER_METRICS)),
         json.dumps(list(PER_MOTIF_METRICS)), json.dumps(max_motifs),
         json.dumps(strchive_info), json.dumps(TIER_COLORS), json.dumps(MOTIF_CLASS_SHADES), json.dumps(OPEN_ENDED_MAX),
     )
 
 
-loci = parse_loci(vcf_path)
+if __name__ == "__main__":
+    failures, _ = doctest.testmod()
+    if failures:
+        raise SystemExit(f"{failures} doctest(s) failed -- fix before trusting the LPS numbers")
+
+loci, lps_verification_rows = parse_loci(vcf_path)
+write_lps_verification(lps_verification_rows, LPS_VERIFICATION_PATH)
+print(f"Wrote {LPS_VERIFICATION_PATH} with {len(lps_verification_rows)} (locus, allele, motif) LPS rows to check")
+
+n_individuals = count_samples(vcf_path)
 metric_labels = parse_format_labels(vcf_path)
 
 strchive_version, strchive_records = fetch_latest_strchive()
@@ -574,7 +710,7 @@ fig.write_html(
     "vcf_allele_histograms.html",
     include_plotlyjs="cdn",
     full_html=True,
-    post_script=redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info),
+    post_script=redraw_script(loci, locus_names, metric_labels, max_motifs, strchive_info, n_individuals),
 )
 
 print(f"Wrote vcf_allele_histograms.html with {len(loci)} loci x {len(METRICS)} metrics")
